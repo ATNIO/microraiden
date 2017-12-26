@@ -1,6 +1,6 @@
 import gevent
 
-from flask import Flask
+from flask import Flask, safe_join
 from flask_restful import (
     Api,
 )
@@ -19,13 +19,21 @@ from microraiden.proxy.resources import (
     ChannelManagementLogout,
     ChannelManagementRoot,
     ChannelManagementStats,
+<<<<<<< HEAD
     StaticFilesServer,
     ChannelTransfer
+=======
+>>>>>>> 2a92e01c5e38ea782c596f4d50f74d529cfad0e5
 )
 
-from microraiden.proxy.content import PaywallDatabase, PaywalledContent
 from microraiden.proxy.resources.expensive import LightClientProxy
+<<<<<<< HEAD
 from microraiden.config import API_PATH, HTML_DIR, JSLIB_DIR
+=======
+from microraiden.config import API_PATH
+from microraiden.proxy.resources.paywall_decorator import Paywall
+
+>>>>>>> 2a92e01c5e38ea782c596f4d50f74d529cfad0e5
 
 import logging
 import ssl
@@ -34,6 +42,7 @@ log = logging.getLogger(__name__)
 
 
 class PaywalledProxy:
+<<<<<<< HEAD
     def __init__(self,
                  channel_manager,
                  flask_app=None,
@@ -46,9 +55,33 @@ class PaywalledProxy:
             self.app = flask_app
         paywall_html_dir = paywall_html_dir or HTML_DIR
         paywall_js_dir = paywall_js_dir or JSLIB_DIR
+=======
+    def __init__(
+            self,
+            channel_manager: ChannelManager,
+            flask_app=None,
+            paywall_html_dir=None,
+            paywall_js_dir=None
+    ):
+        #  this doesn't work atm, due to test teardown problems
+        #  it's not a critical error, but it should be fixed
+        #  gevent.get_hub().SYSTEM_ERROR += (BaseException, )
+        paywall_html_dir = paywall_html_dir or config.HTML_DIR
+        paywall_js_dir = paywall_js_dir or config.JSLIB_DIR
+>>>>>>> 2a92e01c5e38ea782c596f4d50f74d529cfad0e5
         assert isinstance(channel_manager, ChannelManager)
         assert isinstance(paywall_html_dir, str)
-        self.paywall_db = PaywallDatabase()
+
+        if not flask_app:
+            self.app = Flask(
+                __name__,
+                static_url_path=config.JSPREFIX_URL,
+                static_folder=paywall_js_dir
+            )
+        else:
+            assert isinstance(flask_app, Flask)
+            self.app = flask_app
+
         self.api = Api(self.app)
         self.rest_server = None
         self.server_greenlet = None
@@ -56,20 +89,8 @@ class PaywalledProxy:
         self.channel_manager = channel_manager
         self.channel_manager.start()
 
-        self.light_client_proxy = LightClientProxy(paywall_html_dir + "/index.html")
-
-        cfg = {
-            'contract_address': channel_manager.state.contract_address,
-            'receiver_address': channel_manager.receiver,
-            'channel_manager': self.channel_manager,
-            'paywall_db': self.paywall_db,
-            'light_client_proxy': self.light_client_proxy
-        }
-        # static files
-        self.api.add_resource(StaticFilesServer, "/js/<path:content>",
-                              resource_class_kwargs={'directory': paywall_js_dir})
-        # paywall
-        self.api.add_resource(Expensive, "/<path:content>", resource_class_kwargs=cfg)
+        self.light_client_proxy = LightClientProxy(safe_join(paywall_html_dir, "index.html"))
+        self.paywall = Paywall(channel_manager, self.light_client_proxy)
 
         # REST interface
         self.api.add_resource(ChannelManagementLogin, API_PATH + "/login")
@@ -100,12 +121,6 @@ class PaywalledProxy:
 
         self.api.add_resource(ChannelManagementRoot, "/cm")
 
-    def add_content(self, content):
-        assert isinstance(content, PaywalledContent)
-        if content.light_client_proxy is None:
-            content.light_client_proxy = self.light_client_proxy
-        self.paywall_db.add_content(content)
-
     def run(self, host='localhost', port=5000, debug=False, ssl_context=None):
         assert ssl_context is None or len(ssl_context) == 2
         # register our custom error handler to ignore some exceptions and fail on others
@@ -113,8 +128,13 @@ class PaywalledProxy:
         self.channel_manager.wait_sync()
         from gevent.pywsgi import WSGIServer
         if ((ssl_context is not None) and
+<<<<<<< HEAD
                 (len(ssl_context) > 2) and
                 (ssl_context[0] and ssl_context[1])):
+=======
+           (len(ssl_context) == 2) and
+           (ssl_context[0] and ssl_context[1])):
+>>>>>>> 2a92e01c5e38ea782c596f4d50f74d529cfad0e5
             self.rest_server = WSGIServer((host, port), self.app,
                                           keyfile=ssl_context[0],
                                           certfile=ssl_context[1])
@@ -144,6 +164,20 @@ class PaywalledProxy:
     @staticmethod
     def gevent_error_handler(context, exc_info):
         e = exc_info[1]
+        # recover if HTTP request is done to a HTTPS endpoint
         if isinstance(e, ssl.SSLError) and e.reason == 'HTTP_REQUEST':
             return
         gevent.get_hub().handle_system_error(exc_info[0], exc_info[1])
+
+    def add_paywalled_resource(self, cls: Expensive, url: str, price: int=None, *args, **kwargs):
+        cfg = {
+            'channel_manager': self.channel_manager,
+            'light_client_proxy': self.light_client_proxy,
+            'price': price,
+            'paywall': self.paywall
+        }
+        if 'resource_class_kwargs' in kwargs:
+            cfg.update(kwargs.pop('resource_class_kwargs'))
+        if 'endpoint' not in kwargs:
+            kwargs['endpoint'] = url.replace('/', '_')
+        return self.api.add_resource(cls, url, resource_class_kwargs=cfg, *args, **kwargs)

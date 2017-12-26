@@ -1,6 +1,11 @@
+import types
+
+from eth_utils import is_same_address
+from requests import Response
+
 from microraiden.client import Channel
-from microraiden import Client
-from microraiden.crypto import sign_balance_proof, privkey_to_addr
+from microraiden import Client, Session
+from microraiden.utils import privkey_to_addr, sign_close
 
 
 def close_all_channels(client: Client):
@@ -9,23 +14,38 @@ def close_all_channels(client: Client):
 
 
 def close_channel_cooperatively(
-        channel, privkey_receiver, balance: int=None
+        channel: Channel, privkey_receiver: str, contract_address: str, balance: int=None
 ):
     if balance is not None:
-        channel.balance = balance
-    closing_sig = sign_balance_proof(
-        privkey_receiver, channel.receiver, channel.block,
-        channel.balance if balance is None else balance
+        channel.update_balance(balance)
+    closing_sig = sign_close(
+        privkey_receiver,
+        channel.sender,
+        channel.block,
+        channel.balance,
+        contract_address
     )
     assert channel.close_cooperatively(closing_sig)
 
 
 def close_all_channels_cooperatively(
-        client: Client, privkey_receiver, balance: int=None
+        client: Client, privkey_receiver: str, contract_address: str, balance: int=None
 ):
     receiver_addr = privkey_to_addr(privkey_receiver)
     client.sync_channels()
-    channels = [c for c in client.channels
-                if c.state != Channel.State.closed and c.receiver == receiver_addr]
+    channels = [
+        c for c in client.channels
+        if c.state != Channel.State.closed and is_same_address(c.receiver, receiver_addr)
+    ]
     for channel in channels:
-        close_channel_cooperatively(channel, privkey_receiver, balance)
+        close_channel_cooperatively(channel, privkey_receiver, contract_address, balance)
+
+
+def patch_on_http_response(default_http_client: Session, abort_on=[]):
+    def patched(self, method: str, url: str, response: Response, **kwargs):
+        self.last_response = response
+        return (response.status_code not in abort_on)
+    default_http_client.on_http_response = types.MethodType(
+        patched,
+        default_http_client
+    )

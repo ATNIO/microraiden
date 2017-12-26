@@ -4,33 +4,33 @@ from ethereum.tester import keys
 
 import os
 import json
-from microraiden.client.client import CHANNEL_MANAGER_ABI_NAME, TOKEN_ABI_NAME
-from microraiden.crypto import privkey_to_addr
+from microraiden.utils import privkey_to_addr
+from microraiden.config import CONTRACTS_ABI_JSON, CHANNEL_MANAGER_ABI_NAME, TOKEN_ABI_NAME
 
 
 @pytest.fixture
-def contracts_relative_path():
-    return 'data/contracts.json'
+def proxy_ssl():
+    return False
 
 
 @pytest.fixture
-def compiled_contracts_path(test_dir, contracts_relative_path):
-    return os.path.join(test_dir, contracts_relative_path)
+def test_dir(request):
+    return request.fspath.dirname
 
 
 @pytest.fixture
-def compiled_contracts(compiled_contracts_path):
-    return json.load(open(compiled_contracts_path))
-
-
-@pytest.fixture
-def test_dir():
-    return os.path.dirname(os.path.dirname(__file__)) + "/../"
+def proxy_ssl_certs(test_dir):
+    return os.path.join(test_dir + '/data/key.pem'), os.path.join(test_dir + '/data/cert.pem')
 
 
 @pytest.fixture(scope='session')
 def use_tester(request):
     return request.config.getoption('use_tester')
+
+
+@pytest.fixture(scope='session')
+def clean_channels(request):
+    return request.config.getoption('clean_channels')
 
 
 @pytest.fixture
@@ -67,13 +67,13 @@ def deployer_address(deployer_privkey):
 
 @pytest.fixture(scope='session')
 def contract_abi_path():
-    return os.path.join(os.path.dirname(os.path.dirname(__file__)), '../data/contracts.json')
+    return os.path.join(os.path.dirname(os.path.dirname(__file__)), "../" + CONTRACTS_ABI_JSON)
 
 
 @pytest.fixture(scope='session')
 def contract_abis(contract_abi_path):
-    abi_file = open(contract_abi_path, 'r')
-    return json.load(abi_file)
+    with open(contract_abi_path) as abi_file:
+        return json.load(abi_file)
 
 
 @pytest.fixture(scope='session')
@@ -99,3 +99,10 @@ def token_bytecode(contract_abis):
 @pytest.fixture(scope='session')
 def kovan_block_time():
     return 4
+
+
+@pytest.fixture
+def state_db_path(tmpdir):
+    return ':memory:'
+#    db = tmpdir.join("state.db")
+#    return db.strpath

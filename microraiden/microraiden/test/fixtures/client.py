@@ -1,12 +1,8 @@
-import shutil
-import tempfile
-
 import pytest
+from web3 import Web3
 
 from microraiden import Client
-from microraiden.config import GAS_LIMIT
-from microraiden.contract_proxy import ContractProxy, ChannelContractProxy
-from microraiden.crypto import privkey_to_addr
+from microraiden.utils import privkey_to_addr
 from microraiden.test.utils.client import close_all_channels_cooperatively
 
 
@@ -26,58 +22,39 @@ def rpc_port():
 
 
 @pytest.fixture
-def datadir():
-    tmpdir = tempfile.mkdtemp()
-    yield tmpdir
-    shutil.rmtree(tmpdir)
-
-
-@pytest.fixture
-def client_contract_proxy(web3, sender_privkey, channel_manager_contract_address,
-                          channel_manager_abi, use_tester):
-    return ChannelContractProxy(
-        web3,
-        sender_privkey,
-        channel_manager_contract_address,
-        channel_manager_abi,
-        int(20e9), GAS_LIMIT,
-        use_tester
-    )
-
-
-@pytest.fixture
-def client_token_proxy(web3, sender_privkey, token_contract_address, token_abi, use_tester):
-    return ContractProxy(
-        web3,
-        sender_privkey,
-        token_contract_address,
-        token_abi,
-        int(20e9), GAS_LIMIT,
-        use_tester
-    )
+def datadir(tmpdir):
+    return tmpdir.strpath + "client"
 
 
 @pytest.fixture
 def client(
-        sender_privkey,
-        client_contract_proxy,
-        client_token_proxy,
-        datadir,
-        channel_manager_contract_address,
+        sender_privkey: str,
+        channel_manager_address: str,
+        web3: Web3,
+        clean_channels: bool,
+        receiver_privkey: str,
+        patched_contract,
+        revert_chain
 ):
     client = Client(
-        privkey=sender_privkey,
-        channel_manager_proxy=client_contract_proxy,
-        token_proxy=client_token_proxy,
-        datadir=datadir,
-        channel_manager_address=channel_manager_contract_address,
+        private_key=sender_privkey,
+        channel_manager_address=channel_manager_address,
+        web3=web3
     )
+    if clean_channels:
+        close_all_channels_cooperatively(
+            client,
+            receiver_privkey,
+            channel_manager_address,
+            balance=0
+        )
+
     yield client
-    client.close()
 
-
-@pytest.fixture
-def clean_channels(client):
-    close_all_channels_cooperatively(client, balance=0)
-    yield
-    close_all_channels_cooperatively(client, balance=0)
+    if clean_channels:
+        close_all_channels_cooperatively(
+            client,
+            receiver_privkey,
+            channel_manager_address,
+            balance=0
+        )

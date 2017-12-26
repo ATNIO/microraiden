@@ -11,7 +11,8 @@ from eth_utils import (
     is_same_address,
 )
 from ethereum.tester import TransactionFailed
-from web3 import Web3
+from web3 import Web3, HTTPProvider, RPCProvider
+from web3.contract import Contract
 from web3.exceptions import BadFunctionCallOutput
 
 from microraiden import (
@@ -19,15 +20,19 @@ from microraiden import (
     utils,
 )
 from microraiden.channel_manager import ChannelManagerState
-from microraiden.make_helpers import make_contract_proxy
-from microraiden.crypto import privkey_to_addr
+from microraiden.utils import create_signed_contract_transaction, privkey_to_addr, sign_close
 from microraiden.exceptions import StateFileException
-
+from microraiden.make_helpers import make_channel_manager_contract
 
 log = logging.getLogger('close_all_channels')
 
 
 @click.command()
+@click.option(
+    '--rpc-provider',
+    default=config.WEB3_PROVIDER_DEFAULT,
+    help='Address of the Ethereum RPC provider'
+)
 @click.option(
     '--private-key',
     required=True,
@@ -50,7 +55,13 @@ log = logging.getLogger('close_all_channels')
     default=None,
     help='Ethereum address of the channel manager contract'
 )
-def main(private_key, private_key_password_file, state_file, channel_manager_address):
+def main(
+        rpc_provider: RPCProvider,
+        private_key: str,
+        private_key_password_file: str,
+        state_file: str,
+        channel_manager_address: str
+):
     private_key = utils.get_private_key(private_key, private_key_password_file)
     if private_key is None:
         sys.exit(1)
@@ -63,9 +74,9 @@ def main(private_key, private_key_password_file, state_file, channel_manager_add
         app_dir = click.get_app_dir('microraiden')
         state_file = os.path.join(app_dir, state_file_name)
 
-    web3 = Web3(config.WEB3_PROVIDER)
+    web3 = Web3(HTTPProvider(rpc_provider, request_kwargs={'timeout': 60}))
     web3.eth.defaultAccount = receiver_address
-    contract_proxy = make_contract_proxy(web3, private_key, config.CHANNEL_MANAGER_ADDRESS)
+    channel_manager_contract = make_channel_manager_contract(web3, config.CHANNEL_MANAGER_ADDRESS)
 
     try:
         click.echo('Loading state file from {}'.format(state_file))
@@ -83,15 +94,20 @@ def main(private_key, private_key_password_file, state_file, channel_manager_add
 
     click.echo('Closing all open channels with valid balance proofs for '
                'receiver {}'.format(receiver_address))
-    close_open_channels(state, contract_proxy)
+    close_open_channels(private_key, state, channel_manager_contract)
 
 
-def close_open_channels(state, contract_proxy, repetitions=None, wait=lambda: gevent.sleep(1)):
-    contract = contract_proxy.contract
-    web3 = contract_proxy.web3
-
-    channels_with_balance_proof = [c for c in state.channels.values()
-                                   if c.last_signature is not None]
+def close_open_channels(
+        private_key: str,
+        state: ChannelManagerState,
+        channel_manager_contract: Contract,
+        repetitions=None,
+        wait=lambda: gevent.sleep(1)
+):
+    web3 = channel_manager_contract.web3
+    channels_with_balance_proof = [
+        c for c in state.channels.values() if c.last_signature is not None
+    ]
     n_channels = len(state.channels)
     n_no_balance_proof = len(state.channels) - len(channels_with_balance_proof)
     n_txs_sent = 0
@@ -108,7 +124,7 @@ def close_open_channels(state, contract_proxy, repetitions=None, wait=lambda: ge
             # lookup channel on block chain
             channel_id = (channel.sender, channel.receiver, channel.open_block_number)
             try:
-                channel_info = contract.call().getChannelInfo(*channel_id)
+                channel_info = channel_manager_contract.call().getChannelInfo(*channel_id)
             except (BadFunctionCallOutput, TransactionFailed):
                 n_non_existant += 1
                 continue
@@ -120,9 +136,26 @@ def close_open_channels(state, contract_proxy, repetitions=None, wait=lambda: ge
 
             # send close if open or settling with wrong balance, unless already done
             if not close_sent and is_valid:
-                tx_params = [channel.receiver, channel.open_block_number,
-                             channel.balance, decode_hex(channel.last_signature)]
-                raw_tx = contract_proxy.create_signed_transaction('close', tx_params)
+                closing_sig = sign_close(
+                    private_key,
+                    channel.sender,
+                    channel.open_block_number,
+                    channel.balance,
+                    channel_manager_contract.address
+                )
+
+                raw_tx = create_signed_contract_transaction(
+                    private_key,
+                    channel_manager_contract,
+                    'cooperativeClose',
+                    [
+                        channel.receiver,
+                        channel.open_block_number,
+                        channel.balance,
+                        decode_hex(channel.last_signature),
+                        closing_sig
+                    ]
+                )
                 tx_hash = web3.eth.sendRawTransaction(raw_tx)
                 log.info('sending close tx (hash: {})'.format(tx_hash))
                 pending_txs[channel.sender, channel.open_block_number] = tx_hash
@@ -130,11 +163,17 @@ def close_open_channels(state, contract_proxy, repetitions=None, wait=lambda: ge
 
         # print status
         msg_status = 'block: {}, pending txs: {}, total txs sent: {}'
-        msg_progress = ('initial channels: {}, settled: {}, pending txs: {}, no BP: {}, '
-                        'invalid BP: {}')
+        msg_progress = (
+            'initial channels: {}, settled: {}, pending txs: {}, no BP: {}, invalid BP: {}'
+        )
         log.info(msg_status.format(web3.eth.blockNumber, len(pending_txs), n_txs_sent))
-        log.info(msg_progress.format(n_channels, n_non_existant, len(pending_txs),
-                                     n_no_balance_proof, n_invalid_balance_proof))
+        log.info(msg_progress.format(
+            n_channels,
+            n_non_existant,
+            len(pending_txs),
+            n_no_balance_proof,
+            n_invalid_balance_proof
+        ))
 
         # wait for next block
         block_before = web3.eth.blockNumber

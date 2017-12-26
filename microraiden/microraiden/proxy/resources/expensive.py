@@ -1,128 +1,50 @@
 import logging
-from flask_restful import (
-    Resource
-)
+
 from microraiden.channel_manager import (
     ChannelManager,
-    Channel,
-    NoOpenChannel,
-    InvalidBalanceProof,
-    InvalidBalanceAmount,
-    InsufficientConfirmations
 )
-from microraiden.proxy.content import PaywalledContent
-# from microraiden.utils import parse_balance_proof_msg
 
-from microraiden import HTTPHeaders as header
-import microraiden.config as config
-
-from flask import Response, make_response, request
+from flask_restful import Resource
+from eth_utils import is_address
+from .paywall_decorator import paywall_decorator
 
 log = logging.getLogger(__name__)
 
 
-class RequestData:
-    def __init__(self, headers, cookies=None):
-        """parse a flask request object and check if the data received are valid"""
-        from werkzeug.datastructures import EnvironHeaders
-        assert isinstance(headers, EnvironHeaders)
-        self.check_headers(headers)
-        if cookies:
-            self.check_cookies(cookies)
-
-    def check_cookies(self, cookies):
-        if header.BALANCE_SIGNATURE in cookies:
-            self.balance_signature = cookies.get(header.BALANCE_SIGNATURE)
-        if header.OPEN_BLOCK in cookies:
-            self.open_block_number = int(cookies.get(header.OPEN_BLOCK))
-        if header.SENDER_BALANCE in cookies:
-            self.balance = int(cookies.get(header.SENDER_BALANCE))
-        if header.SENDER_ADDRESS in cookies:
-            self.sender_address = cookies.get(header.SENDER_ADDRESS)
-
-    def check_headers(self, headers):
-        """Check if headers sent by the client are valid"""
-        price = headers.get(header.PRICE, None)
-        contract_address = headers.get(header.CONTRACT_ADDRESS, None)
-        receiver_address = headers.get(header.RECEIVER_ADDRESS, None)
-        sender_address = headers.get(header.SENDER_ADDRESS, None)
-        payment = headers.get(header.PAYMENT, None)
-        balance_signature = headers.get(header.BALANCE_SIGNATURE, None)
-        open_block = headers.get(header.OPEN_BLOCK, None)
-        balance = headers.get(header.BALANCE, None)
-        if price:
-            price = int(price)
-        if open_block:
-            open_block = int(open_block)
-        if balance:
-            balance = int(balance)
-        if price and price < 0:
-            raise ValueError("Price must be >= 0")
-        if contract_address and not is_valid_address(contract_address):
-            raise ValueError("Invalid contract address")
-        if receiver_address and not is_valid_address(receiver_address):
-            raise ValueError("Invalid receiver address")
-        if sender_address and not is_valid_address(sender_address):
-            raise ValueError("Invalid sender address")
-        if payment and not isinstance(payment, int):
-            raise ValueError("Payment must be an integer")
-        if open_block and open_block < 0:
-            raise ValueError("Open block must be >= 0")
-        if balance and balance < 0:
-            raise ValueError("Balance must be >= 0")
-
-        self.price = price
-        self.contract_address = contract_address
-        self.receiver_address = receiver_address
-        self.payment = payment
-        self.balance_signature = balance_signature
-        self.sender_address = sender_address
-        self.open_block_number = open_block
-        self.balance = balance
-
-
 class LightClientProxy:
     def __init__(self, index_html):
-        self.data = open(index_html).read()
+        with open(index_html) as fp:
+            self.data = fp.read()
 
-    def get(self, content, receiver, amount, token):
+    def get(self, url):
         return self.data
 
 
-def is_valid_address(address):
-    return address
-
-
 class Expensive(Resource):
-    def __init__(self, contract_address, receiver_address,
-                 channel_manager, paywall_db,
-                 light_client_proxy=None
-                 ):
+    method_decorators = [paywall_decorator]
+
+    def __init__(self,
+                 channel_manager: ChannelManager,
+                 light_client_proxy=None,
+                 paywall=None,
+                 price: None = None,
+                 ) -> None:
         super(Expensive, self).__init__()
         assert isinstance(channel_manager, ChannelManager)
-        assert is_valid_address(contract_address)
-        assert is_valid_address(receiver_address)
-        self.contract_address = is_valid_address(contract_address)
-        self.receiver_address = is_valid_address(receiver_address)
+        assert price is None or callable(price) or price > 0
+        self.contract_address = channel_manager.channel_manager_contract.address
+        self.receiver_address = channel_manager.receiver
+        assert is_address(self.contract_address)
+        assert is_address(self.receiver_address)
         self.channel_manager = channel_manager
-        self.paywall_db = paywall_db
         self.light_client_proxy = light_client_proxy
+        self._price = price
+        self.paywall = paywall
 
-    def get(self, content):
-        log.info(content)
-        if self.channel_manager.node_online() is False:
-            return "Ethereum node is not responding", 502
-        try:
-            data = RequestData(request.headers, request.cookies)
-        except ValueError as e:
-            return str(e), 409
-        proxy_handle = self.paywall_db.get_content(content)
-        if proxy_handle is None:
-            return "NOT FOUND", 404
+    def get_paywall(self, url):
+        return self.light_client_proxy.get(url)
 
-        if proxy_handle.is_paywalled(content) is False:
-            return self.reply_premium(content, proxy_handle, {})
-
+<<<<<<< HEAD
         accepts_html = r'text/html' in request.headers.get('Accept', '')
 
         if not data.balance_signature:
@@ -242,3 +164,10 @@ class Expensive(Resource):
             if hdr in headers:
                 reply.set_cookie(hdr, str(headers[hdr]))
         return reply
+=======
+    def price(self):
+        if callable(self._price):
+            return self._price()
+        else:
+            return self._price
+>>>>>>> 2a92e01c5e38ea782c596f4d50f74d529cfad0e5

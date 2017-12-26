@@ -2,10 +2,11 @@ from flask_restful import Resource, reqparse
 import json
 from collections import defaultdict
 
-from microraiden.crypto import sign_balance_proof
+from microraiden.utils import sign_close
 from microraiden.proxy.resources.login import auth
 from eth_utils import encode_hex
 
+<<<<<<< HEAD
 from microraiden.channel_manager import (
     Channel,
     NoOpenChannel,
@@ -13,6 +14,10 @@ from microraiden.channel_manager import (
     InvalidBalanceAmount,
     InsufficientConfirmations
 )
+=======
+from microraiden.channel_manager import Channel, ChannelManager
+from microraiden.exceptions import NoOpenChannel, InvalidBalanceProof
+>>>>>>> 2a92e01c5e38ea782c596f4d50f74d529cfad0e5
 
 
 class ChannelManagementRoot(Resource):
@@ -22,7 +27,7 @@ class ChannelManagementRoot(Resource):
 
 
 class ChannelManagementStats(Resource):
-    def __init__(self, channel_manager):
+    def __init__(self, channel_manager: ChannelManager):
         super(ChannelManagementStats, self).__init__()
         self.channel_manager = channel_manager
 
@@ -37,7 +42,7 @@ class ChannelManagementStats(Resource):
                 pending_channels.append(v)
             else:
                 open_channels.append(v)
-        contract_address = self.channel_manager.contract_proxy.contract.address
+        contract_address = self.channel_manager.channel_manager_contract.address
         return {'balance_sum': self.channel_manager.get_locked_balance(),
                 'deposit_sum': deposit_sum,
                 'open_channels': len(open_channels),
@@ -45,11 +50,15 @@ class ChannelManagementStats(Resource):
                 'unique_senders': len(unique_senders),
                 'liquid_balance': self.channel_manager.get_liquid_balance(),
                 'token_address': self.channel_manager.token_contract.address,
-                'contract_address': contract_address}
+                'contract_address': contract_address,
+                'receiver_address': self.channel_manager.receiver,
+                'manager_abi': self.channel_manager.channel_manager_contract.abi,
+                'token_abi': self.channel_manager.token_contract.abi
+                }
 
 
 class ChannelManagementListChannels(Resource):
-    def __init__(self, channel_manager):
+    def __init__(self, channel_manager: ChannelManager):
         super(ChannelManagementListChannels, self).__init__()
         self.channel_manager = channel_manager
 
@@ -121,12 +130,7 @@ class ChannelManagementListChannels(Resource):
         channel = self.channel_manager.channels[sender_address, args.block]
         if channel.last_signature != args.signature:
             return "Invalid or outdated balance signature", 400
-        ret = sign_balance_proof(
-            self.channel_manager.private_key,
-            self.channel_manager.receiver,
-            args.block,
-            channel.balance
-        )
+        ret = sign_close(self.channel_manager.private_key, args.signature)
         return ret, 200
 
 
@@ -157,7 +161,7 @@ class ChannelManagementChannelInfo(Resource):
                 sender_address,
                 opening_block,
                 args.balance)
-        except NoOpenChannel as e:
+        except (NoOpenChannel, InvalidBalanceProof) as e:
             return str(e), 400
         except KeyError:
             return "Channel not found", 404

@@ -12,17 +12,17 @@ from .login import (
     ChannelManagementLogin,
     ChannelManagementLogout,
 )
-from .staticfiles import StaticFilesServer
+from .proxy_url import PaywalledProxyUrl
 
 __all__ = (
-    'Expensive',
-    'ChannelManagementRoot',
-    'ChannelManagementListChannels',
-    'ChannelManagementChannelInfo',
-    'ChannelManagementAdmin',
-    'ChannelManagementAdminChannels',
-    'ChannelManagementStats',
-    'ChannelManagementLogin',
-    'ChannelManagementLogout',
-    'StaticFilesServer'
+    Expensive,
+    ChannelManagementRoot,
+    ChannelManagementListChannels,
+    ChannelManagementChannelInfo,
+    ChannelManagementAdmin,
+    ChannelManagementAdminChannels,
+    ChannelManagementStats,
+    ChannelManagementLogin,
+    ChannelManagementLogout,
+    PaywalledProxyUrl
 )

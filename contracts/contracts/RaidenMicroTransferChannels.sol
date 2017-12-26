@@ -1,7 +1,7 @@
-pragma solidity ^0.4.11;
+pragma solidity ^0.4.17;
 
-import "./Token/Token.sol";
-import "./lib/ECVerify.sol";
+import './Token.sol';
+import './lib/ECVerify.sol';
 
 /// @title Raiden MicroTransfer Channels Contract.
 contract RaidenMicroTransferChannels {
@@ -10,34 +10,46 @@ contract RaidenMicroTransferChannels {
      *  Data structures
      */
 
-    address public owner;
-    address public token_address;
-    uint8 public challenge_period;
-    string constant prefix = "\x19Ethereum Signed Message:\n";
+    // Number of blocks to wait from an uncooperativeClose initiated by the sender
+    // in order to give the receiver a chance to respond with a balance proof
+    // in case the sender cheats. After the challenge period, the sender can settle
+    // and delete the channel.
+    uint32 public challenge_period;
 
-    Token token;
+    // Contract semantic version
+    string public constant version = '0.1.0';
 
-    mapping (bytes32 => Channel) channels;
-    mapping (bytes32 => ClosingRequest) closing_requests;
+    // We temporarily limit total token deposits in a channel to 100 tokens with 18 decimals.
+    // This was calculated just for RDN with its current (as of 30/11/2017) price and should
+    // not be considered to be the same for other tokens.
+    // This is just for the bug bounty release, as a safety measure.
+    uint256 public constant channel_deposit_bugbounty_limit = 10 ** 18 * 100;
 
-    // 28 (deposit) + 4 (block no settlement)
+    Token public token;
+
+    mapping (bytes32 => Channel) public channels;
+    mapping (bytes32 => ClosingRequest) public closing_requests;
+
+    // 24 bytes (deposit) + 4 bytes (block number)
     struct Channel {
-        uint192 deposit; // mAX 2^192 == 2^6 * 2^18
-        uint32 open_block_number; // UNIQUE for participants to prevent replay of messages in later channels
+        // uint192 is the maximum uint size needed for deposit based on a
+        // 10^8 * 10^18 token totalSupply.
+        uint192 deposit;
+
+        // Block number at which the channel was opened. Used in creating
+        // a unique identifier for the channel between a sender and receiver.
+        // Supports creation of multiple channels between the 2 parties and prevents
+        // replay of messages in later channels.
+        uint32 open_block_number;
     }
 
+    // 24 bytes (deposit) + 4 bytes (block number)
     struct ClosingRequest {
-        uint32 settle_block_number;
+        // Number of tokens owed by the sender when closing the channel.
         uint192 closing_balance;
-    }
 
-    /*
-     *  Modifiers
-     */
-
-    modifier isToken() {
-        require(msg.sender == token_address);
-        _;
+        // Block number at which the challenge period ends, in case it has been initiated.
+        uint32 settle_block_number;
     }
 
     /*
@@ -52,8 +64,7 @@ contract RaidenMicroTransferChannels {
         address indexed _sender,
         address indexed _receiver,
         uint32 indexed _open_block_number,
-        uint192 _added_deposit,
-        uint192 _deposit);
+        uint192 _added_deposit);
     event ChannelCloseRequested(
         address indexed _sender,
         address indexed _receiver,
@@ -64,277 +75,326 @@ contract RaidenMicroTransferChannels {
         address indexed _receiver,
         uint32 indexed _open_block_number,
         uint192 _balance);
-    event GasCost(
-        string _function_name,
-        uint _gaslimit,
-        uint _gas_remaining);
+
 
     /*
      *  Constructor
      */
 
-    /// @dev Constructor for creating the Raiden microtransfer channels contract.
-    /// @param _token The address of the Token used by the channels.
-    /// @param _challenge_period A fixed number of blocks representing the challenge period after a sender requests the closing of the channel without the receiver's signature.
-    function RaidenMicroTransferChannels(address _token, uint8 _challenge_period) {
-        require(_token != 0x0);
-        require(_challenge_period > 0);
+    /// @notice Constructor for creating the uRaiden microtransfer channels contract.
+    /// @param _token_address The address of the Token used by the uRaiden contract.
+    /// @param _challenge_period A fixed number of blocks representing the challenge period.
+    /// We enforce a minimum of 500 blocks waiting period.
+    /// after a sender requests the closing of the channel without the receiver's signature.
+    function RaidenMicroTransferChannels(address _token_address, uint32 _challenge_period) public {
+        require(_token_address != 0x0);
+        require(addressHasCode(_token_address));
+        require(_challenge_period >= 500);
 
-        owner = msg.sender;
-        token_address = _token;
-        token = Token(_token);
+        token = Token(_token_address);
+
+        // Check if the contract is indeed a token contract
+        require(token.totalSupply() > 0);
 
         challenge_period = _challenge_period;
-    }
-
-    /*
-     *  Public helper functions (constant)
-     */
-
-    /// @dev Returns the unique channel identifier used in the contract.
-    /// @param _sender The address that sends tokens.
-    /// @param _receiver The address that receives tokens.
-    /// @param _open_block_number The block number at which a channel between the sender and receiver was created.
-    /// @return Unique channel identifier.
-    function getKey(
-        address _sender,
-        address _receiver,
-        uint32 _open_block_number)
-        public
-        constant
-        returns (bytes32 data)
-    {
-        return sha3(_sender, _receiver, _open_block_number);
-    }
-
-    /// @dev Returns a hash of the balance message needed to be signed by the sender.
-    /// @param _receiver The address that receives tokens.
-    /// @param _open_block_number The block number at which a channel between the sender and receiver was created.
-    /// @param _balance The amount of tokens owed by the sender to the receiver.
-    /// @return Hash of the balance message.
-    function getBalanceMessage(
-        address _receiver,
-        uint32 _open_block_number,
-        uint192 _balance)
-        public
-        constant
-        returns (string)
-    {
-        string memory str = concat("Receiver: 0x", addressToString(_receiver));
-        str = concat(str, ", Balance: ");
-        str = concat(str, uintToString(uint256(_balance)));
-        str = concat(str, ", Channel ID: ");
-        str = concat(str, uintToString(uint256(_open_block_number)));
-        return str;
-    }
-
-    /*
-     *  Temporary implementation of verifyBalanceProof.
-     *  Message string reproduction is a workaround
-     *  until https://github.com/ethereum/EIPs/pull/712 is implemented.
-     *  Reason: offer the _sender security that the Dapp sends the same balance as in the signed message
-     */
-
-    /// @dev Returns the sender address extracted from the balance proof.
-    /// @param _receiver The address that receives tokens.
-    /// @param _open_block_number The block number at which a channel between the sender and receiver was created.
-    /// @param _balance The amount of tokens owed by the sender to the receiver.
-    /// @param _balance_msg_sig The balance message signed by the sender or receiver.
-    /// @return Address of the balance proof signer.
-    function verifyBalanceProof(
-        address _receiver,
-        uint32 _open_block_number,
-        uint192 _balance,
-        bytes _balance_msg_sig)
-        public
-        constant
-        returns (address)
-    {
-        // Create message which should be signed by sender
-        string memory message = getBalanceMessage(_receiver, _open_block_number, _balance);
-        uint message_length = bytes(message).length;
-        string memory message_length_string = uintToString(message_length);
-
-        // Prefix the message
-        string memory prefixed_message = concat(prefix, message_length_string);
-        prefixed_message = concat(prefixed_message, message);
-
-
-        // Hash the prefixed message string
-        bytes32 prefixed_message_hash = sha3(prefixed_message);
-
-        // Derive address from signature
-        address signer = ECVerify.ecverify(prefixed_message_hash, _balance_msg_sig);
-        return signer;
     }
 
     /*
      *  External functions
      */
 
-    /// @dev Calls createChannel, compatibility with ERC 223; msg.sender is Token contract.
-    /// @param _sender The address that sends the tokens.
+    /// @notice Opens a new channel or tops up an existing one, compatibility with ERC 223.
+    /// @dev Can only be called from the trusted Token contract.
+    /// @param _sender_address The address that sends the tokens.
     /// @param _deposit The amount of tokens that the sender escrows.
     /// @param _data Receiver address in bytes.
-    function tokenFallback(
-        address _sender,
-        uint256 _deposit,
-        bytes _data)
-        external
-    {
+    function tokenFallback(address _sender_address, uint256 _deposit, bytes _data) external {
         // Make sure we trust the token
-        require(msg.sender == token_address);
+        require(msg.sender == address(token));
+
+        uint192 deposit = uint192(_deposit);
+        require(deposit == _deposit);
+
         uint length = _data.length;
 
-        // createChannel - receiver address (20 bytes + padding = 32 bytes)
-        // topUp - receiver address (32 bytes) + open_block_number (4 bytes + padding = 32 bytes)
+        // createChannel - receiver address (20 bytes)
+        // topUp - receiver address (20 bytes) + open_block_number (4 bytes) = 24 bytes
         require(length == 20 || length == 24);
 
         address receiver = addressFromData(_data);
 
         if(length == 20) {
-            createChannelPrivate(_sender, receiver, uint192(_deposit));
-        }
-        else {
+            createChannelPrivate(_sender_address, receiver, deposit);
+        } else {
             uint32 open_block_number = blockNumberFromData(_data);
-            topUpPrivate(_sender, receiver, open_block_number, uint192(_deposit));
+            updateInternalBalanceStructs(
+                _sender_address,
+                receiver,
+                open_block_number,
+                deposit
+            );
         }
     }
 
-    /// @dev Creates a new channel between a sender and a receiver and transfers the sender's token deposit to this contract, compatibility with ERC20 tokens.
-    /// @param _receiver The address that receives tokens.
+    /// @notice Creates a new channel between `msg.sender` and `_receiver_address` and transfers
+    /// the `_deposit` token deposit to this contract, compatibility with ERC20 tokens.
+    /// @param _receiver_address The address that receives tokens.
     /// @param _deposit The amount of tokens that the sender escrows.
-    function createChannelERC20(
-        address _receiver,
-        uint192 _deposit)
-        external
-    {
-        createChannelPrivate(msg.sender, _receiver, _deposit);
+    function createChannelERC20(address _receiver_address, uint192 _deposit) external {
+        createChannelPrivate(msg.sender, _receiver_address, _deposit);
 
-        // transferFrom deposit from _sender to contract
+        // transferFrom deposit from sender to contract
         // ! needs prior approval from user
         require(token.transferFrom(msg.sender, address(this), _deposit));
     }
 
-    /// @dev Increase the sender's current deposit.
-    /// @param _receiver The address that receives tokens.
-    /// @param _open_block_number The block number at which a channel between the sender and receiver was created.
+    /// @notice Increase the channel deposit with `_added_deposit`.
+    /// @param _receiver_address The address that receives tokens.
+    /// @param _open_block_number The block number at which a channel between the
+    /// sender and receiver was created.
     /// @param _added_deposit The added token deposit with which the current deposit is increased.
     function topUpERC20(
-        address _receiver,
+        address _receiver_address,
         uint32 _open_block_number,
         uint192 _added_deposit)
         external
     {
+        updateInternalBalanceStructs(
+            msg.sender,
+            _receiver_address,
+            _open_block_number,
+            _added_deposit
+        );
+
         // transferFrom deposit from msg.sender to contract
         // ! needs prior approval from user
+        // Do transfer after any state change
         require(token.transferFrom(msg.sender, address(this), _added_deposit));
-        topUpPrivate(msg.sender, _receiver, _open_block_number, _added_deposit);
     }
 
-    /// @dev Function called when any of the parties wants to close the channel and settle; receiver needs a balance proof to immediately settle, sender triggers a challenge period.
-    /// @param _receiver The address that receives tokens.
-    /// @param _open_block_number The block number at which a channel between the sender and receiver was created.
+    /// @notice Function called by the sender, receiver or a delegate, with all the needed
+    /// signatures to close the channel and settle immediately.
+    /// @param _receiver_address The address that receives tokens.
+    /// @param _open_block_number The block number at which a channel between the
+    /// sender and receiver was created.
     /// @param _balance The amount of tokens owed by the sender to the receiver.
     /// @param _balance_msg_sig The balance message signed by the sender.
-    function close(
-        address _receiver,
-        uint32 _open_block_number,
-        uint192 _balance,
-        bytes _balance_msg_sig)
-        external
-    {
-        require(_balance_msg_sig.length == 65);
-        address sender = verifyBalanceProof(_receiver, _open_block_number, _balance, _balance_msg_sig);
-
-        if(msg.sender == _receiver) {
-            settleChannel(sender, _receiver, _open_block_number, _balance);
-        }
-        else {
-            require(msg.sender == sender);
-            initChallengePeriod(_receiver, _open_block_number, _balance);
-        }
-    }
-
-    /// @dev Function called by the sender, when he has a closing signature from the receiver; channel is closed immediately.
-    /// @param _receiver The address that receives tokens.
-    /// @param _open_block_number The block number at which a channel between the sender and receiver was created.
-    /// @param _balance The amount of tokens owed by the sender to the receiver.
-    /// @param _balance_msg_sig The balance message signed by the sender.
-    /// @param _closing_sig The hash of the signed balance message, signed by the receiver.
-    function close(
-        address _receiver,
+    /// @param _closing_sig The receiver's signed balance message, containing the sender's address.
+    function cooperativeClose(
+        address _receiver_address,
         uint32 _open_block_number,
         uint192 _balance,
         bytes _balance_msg_sig,
         bytes _closing_sig)
         external
     {
-        require(_balance_msg_sig.length == 65);
-        require(_closing_sig.length == 65);
+        // Derive sender address from signed balance proof
+        address sender = extractBalanceProofSignature(_receiver_address, _open_block_number, _balance, _balance_msg_sig);
 
-        // Derive address from signature
-        address receiver = verifyBalanceProof(_receiver, _open_block_number, _balance, _closing_sig);
-        require(receiver == _receiver);
+        // Derive receiver address from closing signature
+        address receiver = extractClosingSignature(sender, _open_block_number, _balance, _closing_sig);
+        require(receiver == _receiver_address);
 
-        address sender = verifyBalanceProof(_receiver, _open_block_number, _balance, _balance_msg_sig);
-        require(msg.sender == sender);
+        // Both signatures have been verified and the channel can be settled.
         settleChannel(sender, receiver, _open_block_number, _balance);
     }
 
-    /// @dev Function for getting information about a channel.
-    /// @param _sender The address that sends tokens.
-    /// @param _receiver The address that receives tokens.
-    /// @param _open_block_number The block number at which a channel between the sender and receiver was created.
+    /// @notice Sender requests the closing of the channel and starts the challenge period.
+    /// This can only happen once.
+    /// @param _receiver_address The address that receives tokens.
+    /// @param _open_block_number The block number at which a channel between
+    /// the sender and receiver was created.
+    /// @param _balance The amount of tokens owed by the sender to the receiver.
+    function uncooperativeClose(
+        address _receiver_address,
+        uint32 _open_block_number,
+        uint192 _balance)
+        external
+    {
+        bytes32 key = getKey(msg.sender, _receiver_address, _open_block_number);
+
+        require(channels[key].open_block_number > 0);
+        require(closing_requests[key].settle_block_number == 0);
+        require(_balance <= channels[key].deposit);
+
+        // Mark channel as closed
+        closing_requests[key].settle_block_number = uint32(block.number) + challenge_period;
+        require(closing_requests[key].settle_block_number > block.number);
+        closing_requests[key].closing_balance = _balance;
+        ChannelCloseRequested(msg.sender, _receiver_address, _open_block_number, _balance);
+    }
+
+
+    /// @notice Function called by the sender after the challenge period has ended, in order to
+    /// settle and delete the channel, in case the receiver has not closed the channel himself.
+    /// @param _receiver_address The address that receives tokens.
+    /// @param _open_block_number The block number at which a channel between
+    /// the sender and receiver was created.
+    function settle(address _receiver_address, uint32 _open_block_number) external {
+        bytes32 key = getKey(msg.sender, _receiver_address, _open_block_number);
+
+        // Make sure an uncooperativeClose has been initiated
+        require(closing_requests[key].settle_block_number > 0);
+
+        // Make sure the challenge_period has ended
+	    require(block.number > closing_requests[key].settle_block_number);
+
+        settleChannel(msg.sender, _receiver_address, _open_block_number,
+            closing_requests[key].closing_balance
+        );
+    }
+
+    /// @notice Function for retrieving information about a channel.
+    /// @param _sender_address The address that sends tokens.
+    /// @param _receiver_address The address that receives tokens.
+    /// @param _open_block_number The block number at which a channel between the
+    /// sender and receiver was created.
     /// @return Channel information (unique_identifier, deposit, settle_block_number, closing_balance).
     function getChannelInfo(
-        address _sender,
-        address _receiver,
+        address _sender_address,
+        address _receiver_address,
         uint32 _open_block_number)
         external
         constant
         returns (bytes32, uint192, uint32, uint192)
     {
-        bytes32 key = getKey(_sender, _receiver, _open_block_number);
-        require(channels[key].open_block_number != 0);
+        bytes32 key = getKey(_sender_address, _receiver_address, _open_block_number);
+        require(channels[key].open_block_number > 0);
 
-        return (key, channels[key].deposit, closing_requests[key].settle_block_number, closing_requests[key].closing_balance);
+        return (
+            key,
+            channels[key].deposit,
+            closing_requests[key].settle_block_number,
+            closing_requests[key].closing_balance
+        );
     }
 
-    /// @dev Function called by the sender after the challenge period has ended, in case the receiver has not closed the channel.
-    /// @param _receiver The address that receives tokens.
-    /// @param _open_block_number The block number at which a channel between the sender and receiver was created.
-    function settle(
-        address _receiver,
-        uint32 _open_block_number)
-        external
+    /*
+     *  Public functions
+     */
+
+    /// @notice Returns the sender address extracted from the balance proof.
+    /// dev Works with eth_signTypedData https://github.com/ethereum/EIPs/pull/712.
+    /// @param _receiver_address The address that receives tokens.
+    /// @param _open_block_number The block number at which a channel between the
+    /// sender and receiver was created.
+    /// @param _balance The amount of tokens owed by the sender to the receiver.
+    /// @param _balance_msg_sig The balance message signed by the sender.
+    /// @return Address of the balance proof signer.
+    function extractBalanceProofSignature(
+        address _receiver_address,
+        uint32 _open_block_number,
+        uint192 _balance,
+        bytes _balance_msg_sig)
+        public
+        view
+        returns (address)
     {
-        bytes32 key = getKey(msg.sender, _receiver, _open_block_number);
+        // The variable names from below will be shown to the sender when signing
+        // the balance proof, so they have to be kept in sync with the Dapp client.
+        // The hashed strings should be kept in sync with this function's parameters
+        // (variable names and types).
+        // ! Note that EIP712 might change how hashing is done, triggering a
+        // new contract deployment with updated code.
+        bytes32 message_hash = keccak256(
+            keccak256(
+                'string message_id',
+                'address receiver',
+                'uint32 block_created',
+                'uint192 balance',
+                'address contract'
+            ),
+            keccak256(
+                'Sender balance proof signature',
+                _receiver_address,
+                _open_block_number,
+                _balance,
+                address(this)
+            )
+        );
 
-        require(closing_requests[key].settle_block_number != 0);
-	    require(block.number > closing_requests[key].settle_block_number);
+        // Derive address from signature
+        address signer = ECVerify.ecverify(message_hash, _balance_msg_sig);
+        return signer;
+    }
 
-        settleChannel(msg.sender, _receiver, _open_block_number, closing_requests[key].closing_balance);
+    /// @dev Returns the receiver address extracted from the closing signature.
+    /// Works with eth_signTypedData https://github.com/ethereum/EIPs/pull/712.
+    /// @param _sender_address The address that sends tokens.
+    /// @param _open_block_number The block number at which a channel between the
+    /// sender and receiver was created.
+    /// @param _balance The amount of tokens owed by the sender to the receiver.
+    /// @param _closing_sig The receiver's signed balance message, containing the sender's address.
+    /// @return Address of the closing signature signer.
+    function extractClosingSignature(
+        address _sender_address,
+        uint32 _open_block_number,
+        uint192 _balance,
+        bytes _closing_sig)
+        public
+        view
+        returns (address)
+    {
+        // The variable names from below will be shown to the sender when signing
+        // the balance proof, so they have to be kept in sync with the Dapp client.
+        // The hashed strings should be kept in sync with this function's parameters
+        // (variable names and types).
+        // ! Note that EIP712 might change how hashing is done, triggering a
+        // new contract deployment with updated code.
+        bytes32 message_hash = keccak256(
+            keccak256(
+                'string message_id',
+                'address sender',
+                'uint32 block_created',
+                'uint192 balance',
+                'address contract'
+            ),
+            keccak256(
+                'Receiver closing signature',
+                _sender_address,
+                _open_block_number,
+                _balance,
+                address(this)
+            )
+        );
+
+        // Derive address from signature
+        address signer = ECVerify.ecverify(message_hash, _closing_sig);
+        return signer;
+    }
+
+    /// @notice Returns the unique channel identifier used in the contract.
+    /// @param _sender_address The address that sends tokens.
+    /// @param _receiver_address The address that receives tokens.
+    /// @param _open_block_number The block number at which a channel between the
+    /// sender and receiver was created.
+    /// @return Unique channel identifier.
+    function getKey(
+        address _sender_address,
+        address _receiver_address,
+        uint32 _open_block_number)
+        public
+        pure
+        returns (bytes32 data)
+    {
+        return keccak256(_sender_address, _receiver_address, _open_block_number);
     }
 
     /*
      *  Private functions
      */
 
-    /// @dev Creates a new channel between a sender and a receiver, only callable by the Token contract.
-    /// @param _sender The address that receives tokens.
-    /// @param _receiver The address that receives tokens.
+    /// @dev Creates a new channel between a sender and a receiver.
+    /// @param _sender_address The address that sends tokens.
+    /// @param _receiver_address The address that receives tokens.
     /// @param _deposit The amount of tokens that the sender escrows.
-    function createChannelPrivate(
-        address _sender,
-        address _receiver,
-        uint192 _deposit)
-        private
-    {
+    function createChannelPrivate(address _sender_address, address _receiver_address, uint192 _deposit) private {
+        require(_deposit <= channel_deposit_bugbounty_limit);
+
         uint32 open_block_number = uint32(block.number);
 
         // Create unique identifier from sender, receiver and current block number
-        bytes32 key = getKey(_sender, _receiver, open_block_number);
+        bytes32 key = getKey(_sender_address, _receiver_address, open_block_number);
 
         require(channels[key].deposit == 0);
         require(channels[key].open_block_number == 0);
@@ -342,30 +402,33 @@ contract RaidenMicroTransferChannels {
 
         // Store channel information
         channels[key] = Channel({deposit: _deposit, open_block_number: open_block_number});
-        ChannelCreated(_sender, _receiver, _deposit);
+        ChannelCreated(_sender_address, _receiver_address, _deposit);
     }
 
-    /// @dev Funds channel with an additional deposit of tokens, only callable by the Token contract.
-    /// @param _sender The address that sends tokens.
-    /// @param _receiver The address that receives tokens.
-    /// @param _open_block_number The block number at which a channel between the sender and receiver was created.
+    /// @dev Updates internal balance Structures when the sender adds tokens to the channel.
+    /// @param _sender_address The address that sends tokens.
+    /// @param _receiver_address The address that receives tokens.
+    /// @param _open_block_number The block number at which a channel between the
+    /// sender and receiver was created.
     /// @param _added_deposit The added token deposit with which the current deposit is increased.
-    function topUpPrivate(
-        address _sender,
-        address _receiver,
+    function updateInternalBalanceStructs(
+        address _sender_address,
+        address _receiver_address,
         uint32 _open_block_number,
         uint192 _added_deposit)
         private
     {
-        require(_added_deposit != 0);
-        require(_open_block_number != 0);
+        require(_added_deposit > 0);
+        require(_open_block_number > 0);
 
-        bytes32 key = getKey(_sender, _receiver, _open_block_number);
+        bytes32 key = getKey(_sender_address, _receiver_address, _open_block_number);
 
-        require(channels[key].deposit != 0);
+        require(channels[key].deposit > 0);
         require(closing_requests[key].settle_block_number == 0);
+        require(channels[key].deposit + _added_deposit <= channel_deposit_bugbounty_limit);
 
         channels[key].deposit += _added_deposit;
+<<<<<<< HEAD
         ChannelToppedUp(_sender, _receiver, _open_block_number, _added_deposit, channels[key].deposit);
     }
 
@@ -389,86 +452,55 @@ contract RaidenMicroTransferChannels {
         closing_requests[key].settle_block_number = uint32(block.number) + challenge_period;
         closing_requests[key].closing_balance = _balance;
         ChannelCloseRequested(msg.sender, _receiver, _open_block_number, _balance);
+=======
+        assert(channels[key].deposit > _added_deposit);
+        ChannelToppedUp(_sender_address, _receiver_address, _open_block_number, _added_deposit);
+>>>>>>> 2a92e01c5e38ea782c596f4d50f74d529cfad0e5
     }
 
-    /// @dev Closes the channel and settles by transfering the balance to the receiver and the rest of the deposit back to the sender.
-    /// @param _sender The address that sends tokens.
-    /// @param _receiver The address that receives tokens.
-    /// @param _open_block_number The block number at which a channel between the sender and receiver was created.
+    /// @dev Deletes the channel and settles by transfering the balance to the receiver
+    /// and the rest of the deposit back to the sender.
+    /// @param _sender_address The address that sends tokens.
+    /// @param _receiver_address The address that receives tokens.
+    /// @param _open_block_number The block number at which a channel between the
+    /// sender and receiver was created.
     /// @param _balance The amount of tokens owed by the sender to the receiver.
     function settleChannel(
-        address _sender,
-        address _receiver,
+        address _sender_address,
+        address _receiver_address,
         uint32 _open_block_number,
         uint192 _balance)
         private
     {
-        bytes32 key = getKey(_sender, _receiver, _open_block_number);
-        Channel channel = channels[key];
+        bytes32 key = getKey(_sender_address, _receiver_address, _open_block_number);
+        Channel memory channel = channels[key];
 
-        require(channel.open_block_number != 0);
+        require(channel.open_block_number > 0);
         require(_balance <= channel.deposit);
 
-        // send minimum of _balance and deposit to receiver
-        uint send_to_receiver = min(_balance, channel.deposit);
-        if(send_to_receiver > 0) {
-            require(token.transfer(_receiver, send_to_receiver));
-        }
-
-        // send maximum of deposit - balance and 0 to sender
-        uint send_to_sender = max(channel.deposit - _balance, 0);
-        if(send_to_sender > 0) {
-            require(token.transfer(_sender, send_to_sender));
-        }
-
-        assert(channel.deposit >= _balance);
-
-        // remove closed channel structures
+        // Remove closed channel structures
+        // channel.open_block_number will become 0
+        // Change state before transfer call
         delete channels[key];
         delete closing_requests[key];
 
-        ChannelSettled(_sender, _receiver, _open_block_number, _balance);
+        // Send _balance to the receiver, as it is always <= deposit
+        require(token.transfer(_receiver_address, _balance));
+
+        // Send deposit - balance back to sender
+        require(token.transfer(_sender_address, channel.deposit - _balance));
+
+        ChannelSettled(_sender_address, _receiver_address, _open_block_number, _balance);
     }
 
     /*
      *  Internal functions
      */
 
-    /// @dev Internal function for getting the maximum between two numbers.
-    /// @param a First number to compare.
-    /// @param b Second number to compare.
-    /// @return The maximum between the two provided numbers.
-    function max(uint192 a, uint192 b)
-        internal
-        constant
-        returns (uint)
-    {
-        if (a > b) return a;
-        else return b;
-    }
-
-    /// @dev Internal function for getting the minimum between two numbers.
-    /// @param a First number to compare.
-    /// @param b Second number to compare.
-    /// @return The minimum between the two provided numbers.
-    function min(uint192 a, uint192 b)
-        internal
-        constant
-        returns (uint)
-    {
-        if (a < b) return a;
-        else return b;
-    }
-
     /// @dev Internal function for getting an address from tokenFallback data bytes.
     /// @param b Bytes received.
     /// @return Address resulted.
-    function addressFromData (
-        bytes b)
-        internal
-        constant
-        returns (address)
-    {
+    function addressFromData (bytes b) internal pure returns (address) {
         bytes20 addr;
         assembly {
             // Read address bytes
@@ -481,12 +513,7 @@ contract RaidenMicroTransferChannels {
     /// @dev Internal function for getting the block number from tokenFallback data bytes.
     /// @param b Bytes received.
     /// @return Block number.
-    function blockNumberFromData(
-        bytes b)
-        internal
-        constant
-        returns (uint32)
-    {
+    function blockNumberFromData(bytes b) internal pure returns (uint32) {
         bytes4 block_number;
         assembly {
             // Read block number bytes
@@ -496,119 +523,15 @@ contract RaidenMicroTransferChannels {
         return uint32(block_number);
     }
 
-    /*
-     *  Temporary functions.
-     *  Workaround until https://github.com/ethereum/EIPs/pull/712 is done.
-     *  We use these for verifyBalanceProof.
-     */
-
-    function memcpy(
-        uint dest,
-        uint src,
-        uint len)
-        private
-    {
-        // Copy word-length chunks while possible
-        for(; len >= 32; len -= 32) {
-            assembly {
-                mstore(dest, mload(src))
-            }
-            dest += 32;
-            src += 32;
-        }
-
-        // Copy remaining bytes
-        uint mask = 256 ** (32 - len) - 1;
+    /// @dev Check if a contract exists.
+    /// @param _contract The address of the contract to check for.
+    /// @return True if a contract exists, false otherwise
+    function addressHasCode(address _contract) internal constant returns (bool) {
+        uint size;
         assembly {
-            let srcpart := and(mload(src), not(mask))
-            let destpart := and(mload(dest), mask)
-            mstore(dest, or(destpart, srcpart))
-        }
-    }
-
-    function concat(
-        string _self,
-        string _other)
-        internal
-        constant
-        returns (string)
-    {
-        uint self_len = bytes(_self).length;
-        uint other_len = bytes(_other).length;
-        uint self_ptr;
-        uint other_ptr;
-
-        assembly {
-            self_ptr := add(_self, 0x20)
-            other_ptr := add(_other, 0x20)
+            size := extcodesize(_contract)
         }
 
-        var ret = new string(self_len + other_len);
-        uint retptr;
-        assembly { retptr := add(ret, 32) }
-        memcpy(retptr, self_ptr, self_len);
-        memcpy(retptr + self_len, other_ptr, other_len);
-        return ret;
-    }
-
-    function uintToString(
-        uint v)
-        internal
-        constant
-        returns (string)
-    {
-        bytes32 ret;
-        if (v == 0) {
-            ret = '0';
-        }
-        else {
-             while (v > 0) {
-                ret = bytes32(uint(ret) / (2 ** 8));
-                ret |= bytes32(((v % 10) + 48) * 2 ** (8 * 31));
-                v /= 10;
-            }
-        }
-
-        bytes memory bytesString = new bytes(32);
-        uint charCount = 0;
-        for (uint j=0; j<32; j++) {
-            byte char = byte(bytes32(uint(ret) * 2 ** (8 * j)));
-            if (char != 0) {
-                bytesString[j] = char;
-                charCount++;
-            }
-        }
-        bytes memory bytesStringTrimmed = new bytes(charCount);
-        for (j = 0; j < charCount; j++) {
-            bytesStringTrimmed[j] = bytesString[j];
-        }
-
-        return string(bytesStringTrimmed);
-    }
-
-    function addressToString(
-        address x)
-        internal
-        constant
-        returns (string)
-    {
-        bytes memory str = new bytes(40);
-        for (uint i = 0; i < 20; i++) {
-            byte b = byte(uint8(uint(x) / (2**(8*(19 - i)))));
-            byte hi = byte(uint8(b) / 16);
-            byte lo = byte(uint8(b) - 16 * uint8(hi));
-            str[2*i] = char(hi);
-            str[2*i+1] = char(lo);
-        }
-        return string(str);
-    }
-
-    function char(byte b)
-        internal
-        constant
-        returns (byte c)
-    {
-        if (b < 10) return byte(uint8(b) + 0x30);
-        else return byte(uint8(b) + 0x57);
+        return size > 0;
     }
 }
